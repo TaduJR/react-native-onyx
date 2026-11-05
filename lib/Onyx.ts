@@ -82,6 +82,11 @@ function init({
                     continue;
                 }
 
+                // A re-read usually finds what this tab already holds, and a fresh copy of it shouldn't cost subscribers a re-render.
+                if (isReread && !isRemoved && !cache.hasValueChanged(key, value)) {
+                    continue;
+                }
+
                 const collectionKey = OnyxKeys.getCollectionKey(key);
                 const isCollectionMember = !!collectionKey && OnyxKeys.isCollectionMemberKey(collectionKey, key);
 

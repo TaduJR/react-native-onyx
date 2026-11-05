@@ -5011,6 +5011,27 @@ describe('removals synced from another instance while this instance is writing',
         connection.unsubscribe();
     });
 
+    it('should not notify subscribers again when the re-read finds what this instance already holds', async () => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
+        await act(async () => waitForPromisesToResolve());
+        callback.mockClear();
+
+        // Given a re-read that answers with a fresh copy of the write, as IndexedDB does
+        const multiGetMock = jest.mocked(StorageMock.multiGet);
+        multiGetMock.mockClear();
+        multiGetMock.mockResolvedValueOnce([[ONYX_KEYS.TEST_KEY, {n: 1}]]);
+
+        await writeAcrossStaleRemoval(ONYX_KEYS.TEST_KEY, {n: 1});
+
+        // Then subscribers heard only the write itself and the cache keeps the reference they received
+        expect(multiGetMock).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe(callback.mock.calls[0][0]);
+
+        connection.unsubscribe();
+    });
+
     it('should keep the write when storage falls back to memory before the re-read answers', async () => {
         const callback = jest.fn();
         const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
