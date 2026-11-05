@@ -4738,3 +4738,235 @@ describe('null-free cache with init options', () => {
         connection.unsubscribe();
     });
 });
+
+describe('removals synced from another instance while this instance is writing', () => {
+    const COLLECTION = ONYX_KEYS.COLLECTION.TEST_KEY;
+    const MEMBER_1 = `${COLLECTION}1`;
+    const MEMBER_2 = `${COLLECTION}2`;
+
+    let cache: typeof OnyxCache;
+    let syncCallback: (pairs: Array<[OnyxKey, unknown]>) => void;
+
+    // Keeps the next Storage.setItem from landing until the returned task resolves, as if it queued behind the sync read.
+    const holdNextStorageWrite = () => {
+        const setItemMock = jest.mocked(StorageMock.setItem);
+        const writeToStorage = setItemMock.getMockImplementation();
+        const storageWrite = createDeferredTask();
+        setItemMock.mockImplementationOnce((key, value) => storageWrite.promise.then(() => writeToStorage?.(key, value)));
+        return storageWrite;
+    };
+
+    // Writes a value that reaches storage only after a sync read has answered that the key is gone.
+    const writeAcrossStaleRemoval = async (key: OnyxKey, value: unknown) => {
+        const storageWrite = holdNextStorageWrite();
+        const write = Onyx.set(key, value);
+        await act(async () => waitForPromisesToResolve());
+
+        syncCallback([[key, undefined]]);
+        storageWrite.resolve();
+        await write;
+        await act(async () => waitForPromisesToResolve());
+    };
+
+    beforeEach(async () => {
+        Object.assign(OnyxUtils.getDeferredInitTask(), createDeferredTask());
+        cache = require('../../lib/OnyxCache').default;
+
+        Onyx.init({keys: ONYX_KEYS, initialKeyStates: {[ONYX_KEYS.OTHER_TEST]: 42}, shouldSyncMultipleInstances: true});
+        await act(async () => waitForPromisesToResolve());
+        syncCallback = (StorageMock.keepInstancesSync as jest.Mock).mock.calls.at(-1)?.[0];
+    });
+
+    afterEach(() => {
+        jest.restoreAllMocks();
+        return Onyx.clear();
+    });
+
+    it.each([undefined, null])('should keep a write that lands after a removal answered %s, leaving it for Onyx.clear to delete', async (answer) => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        // Given a write whose cache update applied while its storage write is still queued
+        const storageWrite = holdNextStorageWrite();
+        const write = Onyx.set(ONYX_KEYS.TEST_KEY, 'mine');
+        await act(async () => waitForPromisesToResolve());
+
+        // When a sync read ordered before that storage write answers that the key is gone
+        syncCallback([[ONYX_KEYS.TEST_KEY, answer]]);
+
+        // Then subscribers keep the write, while it is in flight and after it lands
+        expect(callback).toHaveBeenLastCalledWith('mine', ONYX_KEYS.TEST_KEY);
+
+        storageWrite.resolve();
+        await write;
+        await act(async () => waitForPromisesToResolve());
+
+        expect(callback).toHaveBeenLastCalledWith('mine', ONYX_KEYS.TEST_KEY);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('mine');
+        expect(await StorageMock.getItem(ONYX_KEYS.TEST_KEY)).toBe('mine');
+
+        // And the key stays indexed, so a later clear still deletes the stored value
+        expect(cache.getAllKeys().has(ONYX_KEYS.TEST_KEY)).toBe(true);
+        await Onyx.clear();
+        expect(await StorageMock.getItem(ONYX_KEYS.TEST_KEY)).toBeNull();
+
+        connection.unsubscribe();
+    });
+
+    it('should merge a later mergeCollection into a member whose write landed after the removal answered', async () => {
+        await writeAcrossStaleRemoval(MEMBER_1, {a: 1, b: 2});
+
+        await Onyx.mergeCollection(COLLECTION, {[MEMBER_1]: {c: 3}} as GenericCollection);
+
+        expect(await StorageMock.getItem(MEMBER_1)).toEqual({a: 1, b: 2, c: 3});
+    });
+
+    it('should let a later null write remove a key whose write landed after the removal answered', async () => {
+        await writeAcrossStaleRemoval(ONYX_KEYS.TEST_KEY, 'mine');
+
+        await Onyx.multiSet({[ONYX_KEYS.TEST_KEY]: null});
+
+        expect(await StorageMock.getItem(ONYX_KEYS.TEST_KEY)).toBeNull();
+    });
+
+    it('should let a later setCollection replace a member whose write landed after the removal answered', async () => {
+        await writeAcrossStaleRemoval(MEMBER_1, {a: 1});
+
+        await Onyx.setCollection(COLLECTION, {[MEMBER_2]: {b: 2}} as GenericCollection);
+
+        expect(await StorageMock.getItem(MEMBER_1)).toBeNull();
+    });
+
+    it('should drop the key once the write settles if the removal landed after it', async () => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        // Given a write that reached storage but has not settled yet
+        const setItemMock = jest.mocked(StorageMock.setItem);
+        const writeToStorage = setItemMock.getMockImplementation();
+        const storageWrite = createDeferredTask();
+        setItemMock.mockImplementationOnce((key, value) => Promise.resolve(writeToStorage?.(key, value)).then(() => storageWrite.promise));
+        const write = Onyx.set(ONYX_KEYS.TEST_KEY, 'mine');
+        await act(async () => waitForPromisesToResolve());
+
+        // When another instance removes the key after it and the sync read answers before the write settles
+        await StorageMock.removeItem(ONYX_KEYS.TEST_KEY);
+        syncCallback([[ONYX_KEYS.TEST_KEY, undefined]]);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('mine');
+
+        storageWrite.resolve();
+        await write;
+        await act(async () => waitForPromisesToResolve());
+
+        // Then this instance ends up matching storage, with the key gone
+        expect(callback).toHaveBeenLastCalledWith(undefined, ONYX_KEYS.TEST_KEY);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBeUndefined();
+        expect(cache.getAllKeys().has(ONYX_KEYS.TEST_KEY)).toBe(false);
+
+        connection.unsubscribe();
+    });
+
+    it('should keep the default a local clear restored when a removal answers during that clear', async () => {
+        await Onyx.set(ONYX_KEYS.OTHER_TEST, 7);
+
+        const removeItemsMock = jest.mocked(StorageMock.removeItems);
+        const removeFromStorage = removeItemsMock.getMockImplementation();
+        const storageRemoval = createDeferredTask();
+        removeItemsMock.mockImplementationOnce((keys) => storageRemoval.promise.then(() => removeFromStorage?.(keys)));
+
+        const clear = Onyx.clear();
+        await act(async () => waitForPromisesToResolve());
+        expect(cache.get(ONYX_KEYS.OTHER_TEST)).toBe(42);
+
+        syncCallback([[ONYX_KEYS.OTHER_TEST, undefined]]);
+        storageRemoval.resolve();
+        await clear;
+        await act(async () => waitForPromisesToResolve());
+
+        expect(cache.get(ONYX_KEYS.OTHER_TEST)).toBe(42);
+        expect(cache.getAllKeys().has(ONYX_KEYS.OTHER_TEST)).toBe(true);
+    });
+
+    it('should drop a batched key with no write in flight right away and keep the one being written', async () => {
+        await Onyx.set(MEMBER_2, {id: 2});
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: COLLECTION, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        const storageWrite = holdNextStorageWrite();
+        const write = Onyx.set(MEMBER_1, {id: 1});
+        await act(async () => waitForPromisesToResolve());
+
+        await StorageMock.removeItem(MEMBER_2);
+        syncCallback([
+            [MEMBER_1, undefined],
+            [MEMBER_2, undefined],
+        ]);
+
+        expect(cache.getAllKeys().has(MEMBER_2)).toBe(false);
+        expect(callback).toHaveBeenLastCalledWith({[MEMBER_1]: {id: 1}}, COLLECTION);
+
+        storageWrite.resolve();
+        await write;
+        await act(async () => waitForPromisesToResolve());
+
+        expect(callback).toHaveBeenLastCalledWith({[MEMBER_1]: {id: 1}}, COLLECTION);
+
+        connection.unsubscribe();
+    });
+
+    it('should re-read a batch together so its collection is notified once', async () => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: COLLECTION, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        const storageWrite1 = holdNextStorageWrite();
+        const storageWrite2 = holdNextStorageWrite();
+        const writes = Promise.all([Onyx.set(MEMBER_1, {id: 1}), Onyx.set(MEMBER_2, {id: 2})]);
+        await act(async () => waitForPromisesToResolve());
+
+        callback.mockClear();
+        const multiGetMock = jest.mocked(StorageMock.multiGet);
+        multiGetMock.mockClear();
+
+        // Values that differ from what this instance holds, so the re-read has a change to notify about.
+        multiGetMock.mockResolvedValueOnce([
+            [MEMBER_1, {id: 3}],
+            [MEMBER_2, {id: 4}],
+        ]);
+
+        syncCallback([
+            [MEMBER_1, undefined],
+            [MEMBER_2, undefined],
+        ]);
+        storageWrite1.resolve();
+        storageWrite2.resolve();
+        await writes;
+        await act(async () => waitForPromisesToResolve());
+
+        expect(multiGetMock).toHaveBeenCalledTimes(1);
+        expect(multiGetMock).toHaveBeenCalledWith([MEMBER_1, MEMBER_2]);
+        expect(callback).toHaveBeenCalledTimes(1);
+
+        connection.unsubscribe();
+    });
+
+    it('should keep the write and log when the re-read fails', async () => {
+        const logHmmmSpy = jest.spyOn(Logger, 'logHmmm');
+        jest.mocked(StorageMock.multiGet).mockRejectedValueOnce(new Error('read failed'));
+
+        const storageWrite = holdNextStorageWrite();
+        const write = Onyx.set(ONYX_KEYS.TEST_KEY, 'mine');
+        await act(async () => waitForPromisesToResolve());
+
+        syncCallback([[ONYX_KEYS.TEST_KEY, undefined]]);
+        storageWrite.resolve();
+        await write;
+        await act(async () => waitForPromisesToResolve());
+
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('mine');
+        expect(logHmmmSpy).toHaveBeenCalledWith(expect.stringContaining('read failed'));
+    });
+});

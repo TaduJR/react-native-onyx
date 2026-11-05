@@ -1,6 +1,7 @@
 import * as Logger from './Logger';
 import cache, {TASK} from './OnyxCache';
 import Storage from './storage';
+import type {StorageKeyValuePair} from './storage/providers/types';
 import utils from './utils';
 import DevTools, {initDevTools} from './DevTools';
 import type {
@@ -60,9 +61,10 @@ function init({
         // a single write. We process it synchronously, grouping collection members so each affected
         // collection is notified once (mirroring the local mergeCollection batching) instead of
         // re-delivering the whole collection per member.
-        Storage.keepInstancesSync?.((pairs) => {
+        const applyChangesFromStorage = (pairs: StorageKeyValuePair[]) => {
             const individual: Array<[OnyxKey, OnyxEntry<KeyValueMapping[OnyxKey]>]> = [];
             const collectionBatches = new Map<string, {partial: NonUndefined<OnyxCollection<KeyValueMapping[OnyxKey]>>; previous: NonUndefined<OnyxCollection<KeyValueMapping[OnyxKey]>>}>();
+            const keysToReread: OnyxKey[] = [];
 
             for (const [key, valueFromStorage] of pairs) {
                 // RAM-only keys should never sync from storage as they may have stale persisted data
@@ -72,13 +74,20 @@ function init({
                 }
 
                 const value = utils.needsNormalization(valueFromStorage) ? utils.removeNestedNullValues(valueFromStorage) : valueFromStorage;
+                const isRemoved = value === null || value === undefined;
+
+                // A removal may predate a write still in flight, and acting on it would lose that write, so ask storage again once the writes settle.
+                if (isRemoved && PendingWrites.getPendingWritesForKey(key).length > 0) {
+                    keysToReread.push(key);
+                    continue;
+                }
 
                 const collectionKey = OnyxKeys.getCollectionKey(key);
                 const isCollectionMember = !!collectionKey && OnyxKeys.isCollectionMemberKey(collectionKey, key);
 
                 // Capture the previous cached value before the cache changes so notifyCollection() can diff old vs new per member.
                 const previousValue = isCollectionMember ? cache.get(key) : undefined;
-                if (value === null || value === undefined) {
+                if (isRemoved) {
                     // Drop like a local removal, so the key leaves the index instead of lingering as an indexed key with no value.
                     cache.drop(key);
                 } else {
@@ -98,7 +107,8 @@ function init({
                         batch.previous[key] = previousValue;
                     }
                 } else {
-                    individual.push([key, value]);
+                    // Providers can answer null for a missing key, while subscribers expect undefined.
+                    individual.push([key, value ?? undefined]);
                 }
             }
 
@@ -112,7 +122,21 @@ function init({
             for (const [collectionKey, {partial, previous}] of collectionBatches) {
                 OnyxUtils.notifyCollection(collectionKey, partial, previous);
             }
-        });
+
+            if (keysToReread.length === 0) {
+                return;
+            }
+
+            // Re-read the keys together to keep the batch's single collection notification.
+            Promise.allSettled(keysToReread.flatMap((key) => PendingWrites.getPendingWritesForKey(key)))
+                .then(() => Storage.multiGet(keysToReread))
+                .then(applyChangesFromStorage)
+                .catch((error: unknown) => {
+                    Logger.logHmmm(`Could not re-read ${keysToReread.length} keys another tab removed while this tab was writing them. Error: ${String(error)}`);
+                });
+        };
+
+        Storage.keepInstancesSync?.(applyChangesFromStorage);
     }
 
     OnyxUtils.initStoreValues(keys, initialKeyStates, evictableKeys);

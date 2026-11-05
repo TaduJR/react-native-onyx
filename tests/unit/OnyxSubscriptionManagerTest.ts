@@ -361,6 +361,45 @@ describe('OnyxSubscriptionManager', () => {
             return syncCallback as (pairs: Array<[OnyxKey, unknown]>) => void;
         };
 
+        // Writes a value that reaches storage only after a sync read has answered that the key is gone.
+        const writeAcrossStaleRemoval = async (key: OnyxKey, value: unknown) => {
+            const setItemMock = jest.mocked(StorageMock.setItem);
+            const writeToStorage = setItemMock.getMockImplementation();
+            const storageWrite = createDeferredTask();
+            setItemMock.mockImplementationOnce((itemKey, itemValue) => storageWrite.promise.then(() => writeToStorage?.(itemKey, itemValue)));
+
+            const write = Onyx.set(key, value);
+            await waitForPromisesToResolve();
+            getSyncCallback()([[key, undefined]]);
+            storageWrite.resolve();
+            await write;
+            await waitForPromisesToResolve();
+        };
+
+        it('should have no miss to report after a write lands behind a removal answer, and a later merge should build on it', async () => {
+            await writeAcrossStaleRemoval(ONYXKEYS.TEST_KEY, {a: 1, b: 2});
+
+            expect(onyxSubscriptionManager.getState(ONYXKEYS.TEST_KEY)).toEqual({a: 1, b: 2});
+            await waitForPromisesToResolve();
+            expect(logHmmmSpy).not.toHaveBeenCalled();
+
+            await Onyx.merge(ONYXKEYS.TEST_KEY, {c: 3});
+
+            expect(await StorageMock.getItem(ONYXKEYS.TEST_KEY)).toEqual({a: 1, b: 2, c: 3});
+        });
+
+        it('should still report the value if it is lost after a write lands behind a removal answer', async () => {
+            await writeAcrossStaleRemoval(ONYXKEYS.TEST_KEY, {a: 1});
+
+            // The key stayed indexed, so the guard lets this miss through to the storage check.
+            jest.spyOn(cache, 'get').mockReturnValueOnce(undefined);
+            expect(onyxSubscriptionManager.getState(ONYXKEYS.TEST_KEY)).toBeUndefined();
+            await waitForPromisesToResolve();
+
+            expect(logHmmmSpy).toHaveBeenCalledTimes(1);
+            expect(logHmmmSpy).toHaveBeenCalledWith(expect.stringContaining(ONYXKEYS.TEST_KEY));
+        });
+
         it('should report once when the cache has no value but storage does', async () => {
             await StorageMock.setItem(ONYXKEYS.TEST_KEY, 'from-storage');
             forgetValueButKeepKey(ONYXKEYS.TEST_KEY);
@@ -446,6 +485,27 @@ describe('OnyxSubscriptionManager', () => {
             await waitForPromisesToResolve();
 
             expect(getItemMock).not.toHaveBeenCalled();
+            expect(logHmmmSpy).not.toHaveBeenCalled();
+        });
+
+        it('should drop a non-collection key another tab removed, with no extra read or report', async () => {
+            const syncCallback = getSyncCallback();
+            const getItemMock = jest.mocked(StorageMock.getItem);
+            const multiGetMock = jest.mocked(StorageMock.multiGet);
+
+            await Onyx.set(ONYXKEYS.TEST_KEY, 'value');
+            await StorageMock.removeItem(ONYXKEYS.TEST_KEY);
+            getItemMock.mockClear();
+            multiGetMock.mockClear();
+
+            syncCallback([[ONYXKEYS.TEST_KEY, undefined]]);
+
+            expect(cache.getAllKeys().has(ONYXKEYS.TEST_KEY)).toBe(false);
+            expect(onyxSubscriptionManager.getState(ONYXKEYS.TEST_KEY)).toBeUndefined();
+            await waitForPromisesToResolve();
+
+            expect(getItemMock).not.toHaveBeenCalled();
+            expect(multiGetMock).not.toHaveBeenCalled();
             expect(logHmmmSpy).not.toHaveBeenCalled();
         });
 
