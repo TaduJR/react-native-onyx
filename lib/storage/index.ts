@@ -24,13 +24,21 @@ const initPromise = new Promise((resolve) => {
 type Storage = {
     getStorageProvider: () => StorageProvider<unknown>;
     degradeToMemoryOnly: (error: unknown) => void;
+    isMemoryOnly: () => boolean;
 } & Omit<StorageProvider<unknown>, 'name' | 'store'>;
+
+/**
+ * Whether storage has fallen back to memory, which other tabs can't see, so its answers say nothing about their changes
+ */
+function isMemoryOnly(): boolean {
+    return provider === MemoryOnlyProvider;
+}
 
 /**
  * Degrade performance by removing the storage provider and only using cache
  */
 function degradePerformance(error: Error) {
-    if (provider === MemoryOnlyProvider) {
+    if (isMemoryOnly()) {
         return;
     }
 
@@ -77,6 +85,8 @@ const storage: Storage = {
     },
 
     degradeToMemoryOnly: (error) => degradePerformance(error instanceof Error ? error : new Error(String(error))),
+
+    isMemoryOnly,
 
     /**
      * Classifies a write error using the platform provider's own classifier. Synchronous and pure —
@@ -230,7 +240,7 @@ const storage: Storage = {
 
         shouldKeepInstancesSync = true;
         InstanceSync.init((pairs: StorageKeyValuePair[]) => {
-            if (provider === MemoryOnlyProvider) {
+            if (isMemoryOnly()) {
                 return;
             }
             onStorageKeysChanged(pairs);

@@ -5010,4 +5010,23 @@ describe('removals synced from another instance while this instance is writing',
 
         connection.unsubscribe();
     });
+
+    it('should keep the write when storage falls back to memory before the re-read answers', async () => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        // Given storage that fell back to memory, which holds no copy of the write
+        jest.mocked(StorageMock.isMemoryOnly).mockReturnValueOnce(true);
+        jest.mocked(StorageMock.multiGet).mockResolvedValueOnce([[ONYX_KEYS.TEST_KEY, null]]);
+
+        await writeAcrossStaleRemoval(ONYX_KEYS.TEST_KEY, 'mine');
+
+        // Then the cache, the only copy left, keeps it
+        expect(callback).toHaveBeenLastCalledWith('mine', ONYX_KEYS.TEST_KEY);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('mine');
+        expect(cache.getAllKeys().has(ONYX_KEYS.TEST_KEY)).toBe(true);
+
+        connection.unsubscribe();
+    });
 });

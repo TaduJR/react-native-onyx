@@ -131,6 +131,15 @@ describe('storage/tryOrDegradePerformance', () => {
         expect(storage.getStorageProvider().name).toBe('MemoryOnlyProvider');
     });
 
+    it('should report being memory-only once it has degraded', () => {
+        const {storage} = loadIsolatedStorage();
+        expect(storage.isMemoryOnly()).toBe(false);
+
+        storage.degradeToMemoryOnly(new DOMException('Internal error.', 'UnknownError'));
+
+        expect(storage.isMemoryOnly()).toBe(true);
+    });
+
     it('should log the degrade only once when degradeToMemoryOnly is called repeatedly', () => {
         const {storage, Logger} = loadIsolatedStorage();
         const capturedLogs: CapturedLog[] = [];

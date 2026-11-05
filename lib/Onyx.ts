@@ -130,7 +130,13 @@ function init({
             // Re-read the keys together to keep the batch's single collection notification.
             Promise.allSettled(keysToReread.flatMap((key) => PendingWrites.getPendingWritesForKey(key)))
                 .then(() => Storage.multiGet(keysToReread))
-                .then((rereadPairs) => applyChangesFromStorage(rereadPairs, true))
+                .then((rereadPairs) => {
+                    // Storage fell back to memory during the wait and the cache may hold the only copy, so ignore this answer like any sync after a fallback.
+                    if (Storage.isMemoryOnly()) {
+                        return;
+                    }
+                    applyChangesFromStorage(rereadPairs, true);
+                })
                 .catch((error: unknown) => {
                     Logger.logHmmm(`Could not re-read ${keysToReread.length} keys another tab removed while this tab was writing them. Error: ${String(error)}`);
                 });

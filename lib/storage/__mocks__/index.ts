@@ -20,6 +20,7 @@ const StorageMock = {
     classifyError: jest.fn(classifyError),
     getStorageProvider: jest.fn(() => MemoryOnlyProvider),
     degradeToMemoryOnly: jest.fn(),
+    isMemoryOnly: jest.fn(() => false),
     getItem: jest.fn(MemoryOnlyProvider.getItem),
     multiGet: jest.fn(MemoryOnlyProvider.multiGet),
     setItem: jest.fn(MemoryOnlyProvider.setItem),
