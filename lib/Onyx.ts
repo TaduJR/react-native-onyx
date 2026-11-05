@@ -61,7 +61,7 @@ function init({
         // a single write. We process it synchronously, grouping collection members so each affected
         // collection is notified once (mirroring the local mergeCollection batching) instead of
         // re-delivering the whole collection per member.
-        const applyChangesFromStorage = (pairs: StorageKeyValuePair[]) => {
+        const applyChangesFromStorage = (pairs: StorageKeyValuePair[], isReread = false) => {
             const individual: Array<[OnyxKey, OnyxEntry<KeyValueMapping[OnyxKey]>]> = [];
             const collectionBatches = new Map<string, {partial: NonUndefined<OnyxCollection<KeyValueMapping[OnyxKey]>>; previous: NonUndefined<OnyxCollection<KeyValueMapping[OnyxKey]>>}>();
             const keysToReread: OnyxKey[] = [];
@@ -76,8 +76,8 @@ function init({
                 const value = utils.needsNormalization(valueFromStorage) ? utils.removeNestedNullValues(valueFromStorage) : valueFromStorage;
                 const isRemoved = value === null || value === undefined;
 
-                // A removal may predate a write still in flight, and acting on it would lose that write, so ask storage again once the writes settle.
-                if (isRemoved && PendingWrites.getPendingWritesForKey(key).length > 0) {
+                // A removal, or any re-read answer, may predate a write still in flight, and acting on it would lose that write, so ask storage again once the writes settle.
+                if ((isRemoved || isReread) && PendingWrites.getPendingWritesForKey(key).length > 0) {
                     keysToReread.push(key);
                     continue;
                 }
@@ -130,13 +130,13 @@ function init({
             // Re-read the keys together to keep the batch's single collection notification.
             Promise.allSettled(keysToReread.flatMap((key) => PendingWrites.getPendingWritesForKey(key)))
                 .then(() => Storage.multiGet(keysToReread))
-                .then(applyChangesFromStorage)
+                .then((rereadPairs) => applyChangesFromStorage(rereadPairs, true))
                 .catch((error: unknown) => {
                     Logger.logHmmm(`Could not re-read ${keysToReread.length} keys another tab removed while this tab was writing them. Error: ${String(error)}`);
                 });
         };
 
-        Storage.keepInstancesSync?.(applyChangesFromStorage);
+        Storage.keepInstancesSync?.((pairs) => applyChangesFromStorage(pairs));
     }
 
     OnyxUtils.initStoreValues(keys, initialKeyStates, evictableKeys);

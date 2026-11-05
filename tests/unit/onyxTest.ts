@@ -4969,4 +4969,45 @@ describe('removals synced from another instance while this instance is writing',
         expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('mine');
         expect(logHmmmSpy).toHaveBeenCalledWith(expect.stringContaining('read failed'));
     });
+
+    it('should read again instead of applying a re-read answer that a newer write has overtaken', async () => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        // Given a re-read that sees the first write but answers only after a second write has started
+        const multiGetMock = jest.mocked(StorageMock.multiGet);
+        multiGetMock.mockClear();
+        const readStorage = multiGetMock.getMockImplementation();
+        const rereadAnswer = createDeferredTask();
+        multiGetMock.mockImplementationOnce((keys) => {
+            const answer = readStorage?.(keys) as ReturnType<typeof StorageMock.multiGet>;
+            return rereadAnswer.promise.then(() => answer);
+        });
+        await writeAcrossStaleRemoval(ONYX_KEYS.TEST_KEY, 'first');
+
+        const storageWrite = holdNextStorageWrite();
+        const write = Onyx.set(ONYX_KEYS.TEST_KEY, 'second');
+        await act(async () => waitForPromisesToResolve());
+
+        // When that re-read answers with the first write's value
+        rereadAnswer.resolve();
+        await act(async () => waitForPromisesToResolve());
+
+        // Then the newer write stays in place
+        expect(callback).toHaveBeenLastCalledWith('second', ONYX_KEYS.TEST_KEY);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('second');
+
+        // And storage is read once more after that write settles, which matches
+        storageWrite.resolve();
+        await write;
+        await act(async () => waitForPromisesToResolve());
+
+        expect(multiGetMock).toHaveBeenCalledTimes(2);
+        expect(callback).toHaveBeenLastCalledWith('second', ONYX_KEYS.TEST_KEY);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBe('second');
+        expect(await StorageMock.getItem(ONYX_KEYS.TEST_KEY)).toBe('second');
+
+        connection.unsubscribe();
+    });
 });
