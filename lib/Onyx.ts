@@ -61,7 +61,8 @@ function init({
         // a single write. We process it synchronously, grouping collection members so each affected
         // collection is notified once (mirroring the local mergeCollection batching) instead of
         // re-delivering the whole collection per member.
-        const applyChangesFromStorage = (pairs: StorageKeyValuePair[], isReread = false) => {
+        const applyChangesFromStorage = (pairs: StorageKeyValuePair[], cachedBeforeReread?: Map<OnyxKey, OnyxValue<OnyxKey>>) => {
+            const isReread = cachedBeforeReread !== undefined;
             const individual: Array<[OnyxKey, OnyxEntry<KeyValueMapping[OnyxKey]>]> = [];
             const collectionBatches = new Map<string, {partial: NonUndefined<OnyxCollection<KeyValueMapping[OnyxKey]>>; previous: NonUndefined<OnyxCollection<KeyValueMapping[OnyxKey]>>}>();
             const keysToReread: OnyxKey[] = [];
@@ -76,8 +77,11 @@ function init({
                 const value = utils.needsNormalization(valueFromStorage) ? utils.removeNestedNullValues(valueFromStorage) : valueFromStorage;
                 const isRemoved = value === null || value === undefined;
 
+                // set(null) and merge(null) never count as pending writes, so a re-read answer for a key whose cache entry changed during the read can predate one of them.
+                const hasChangedDuringReread = isReread && cache.get(key) !== cachedBeforeReread?.get(key);
+
                 // A removal, or any re-read answer, may predate a write still in flight, and acting on it would lose that write, so ask storage again once the writes settle.
-                if ((isRemoved || isReread) && PendingWrites.getPendingWritesForKey(key).length > 0) {
+                if (hasChangedDuringReread || ((isRemoved || isReread) && PendingWrites.getPendingWritesForKey(key).length > 0)) {
                     keysToReread.push(key);
                     continue;
                 }
@@ -132,15 +136,17 @@ function init({
                 return;
             }
 
-            // Re-read the keys together to keep the batch's single collection notification.
-            Promise.allSettled(keysToReread.flatMap((key) => PendingWrites.getPendingWritesForKey(key)))
-                .then(() => Storage.multiGet(keysToReread))
-                .then((rereadPairs) => {
-                    // Storage fell back to memory during the wait and the cache may hold the only copy, so ignore this answer like any sync after a fallback.
-                    if (Storage.isMemoryOnly()) {
-                        return;
-                    }
-                    applyChangesFromStorage(rereadPairs, true);
+            // Read the deferred keys together, so each of their collections is notified once more rather than once per key.
+            Promise.allSettled(new Set(keysToReread.flatMap((key) => PendingWrites.getPendingWritesForKey(key))))
+                .then(() => {
+                    const cacheSnapshot = new Map(keysToReread.map((key): [OnyxKey, OnyxValue<OnyxKey>] => [key, cache.get(key)]));
+                    return Storage.multiGet(keysToReread).then((rereadPairs) => {
+                        // Storage fell back to memory during the wait and the cache may hold the only copy, so ignore this answer like any sync after a fallback.
+                        if (Storage.isMemoryOnly()) {
+                            return;
+                        }
+                        applyChangesFromStorage(rereadPairs, cacheSnapshot);
+                    });
                 })
                 .catch((error: unknown) => {
                     Logger.logHmmm(`Could not re-read ${keysToReread.length} keys another tab removed while this tab was writing them. Error: ${String(error)}`);

@@ -5011,6 +5011,38 @@ describe('removals synced from another instance while this instance is writing',
         connection.unsubscribe();
     });
 
+    it.each([
+        ['set', () => Onyx.set(ONYX_KEYS.TEST_KEY, null)],
+        ['merge', () => Onyx.merge(ONYX_KEYS.TEST_KEY, null)],
+    ])('should not bring back a key removed with %s(null) while its re-read was in flight', async (_method, removeKey) => {
+        const callback = jest.fn();
+        const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
+        await act(async () => waitForPromisesToResolve());
+
+        // Given a re-read that sees the write but answers only after this instance has removed the key
+        const multiGetMock = jest.mocked(StorageMock.multiGet);
+        const readStorage = multiGetMock.getMockImplementation();
+        const rereadAnswer = createDeferredTask();
+        multiGetMock.mockImplementationOnce((keys) => {
+            const answer = readStorage?.(keys) as ReturnType<typeof StorageMock.multiGet>;
+            return rereadAnswer.promise.then(() => answer);
+        });
+        await writeAcrossStaleRemoval(ONYX_KEYS.TEST_KEY, 'first');
+        await removeKey();
+        await act(async () => waitForPromisesToResolve());
+
+        // When that re-read answers with the write's value
+        rereadAnswer.resolve();
+        await act(async () => waitForPromisesToResolve());
+
+        // Then the key stays removed, as it is in storage
+        expect(callback).toHaveBeenLastCalledWith(undefined, ONYX_KEYS.TEST_KEY);
+        expect(cache.get(ONYX_KEYS.TEST_KEY)).toBeUndefined();
+        expect(await StorageMock.getItem(ONYX_KEYS.TEST_KEY)).toBeNull();
+
+        connection.unsubscribe();
+    });
+
     it('should not notify subscribers again when the re-read finds what this instance already holds', async () => {
         const callback = jest.fn();
         const connection = Onyx.connect({key: ONYX_KEYS.TEST_KEY, callback});
